@@ -3,6 +3,10 @@ use std::ops::Range;
 use bitvec::prelude::BitArray;
 use paste::paste;
 
+use crate::instructions::opcode::Memory;
+
+mod instructions;
+
 // https://llx.com/Neil/a2/opcodes.html
 
 // https://en.wikipedia.org/wiki/MOS_Technology_6502#Addressing
@@ -16,7 +20,9 @@ use paste::paste;
 // need any operand data. Immediate mode uses an 8-bit literal operand.
 
 // 6502 instruction operation codes (opcodes) are 8 bits long and have the general form AAABBBCC,
-// where AAA and CC define the opcode, and BBB defines the addressing mode.
+// where AAA and CC define the opcode.rs, and BBB defines the addressing mode.
+
+// Page size: 256 bytes
 
 const STACK_ADDRESS_SPACE: Range<u16> = Range {
     start: 0x100,
@@ -77,262 +83,271 @@ struct Registers {
 
 struct Instruction {
     opcode: Opcode,
-    addressing_mode: AddressingMode,
+    addressing_mode: AddressingModeType,
 }
 
-enum AddressingMode {
-    /// A
+enum AddressingValue {
+    /// Accumulator: A
+    /// Like implied addressing but object being the accumulator
     Accumulator,
-    /// i
+    /// Implied
+    /// No memory reference
     Implied,
-    /// #
-    Immediate,
-    /// a
-    Absolute,
-    /// zp
-    ZeroPage,
-    /// r
-    Relative,
-    /// a
-    AbsoluteIndirect,
-    /// a,x
-    AbsoluteIndexedWithX,
-    /// a,y
-    AbsoluteIndexedWithY,
-    /// zp,x
-    ZeroPageIndexedWithX,
-    /// zp,y
-    ZeroPageIndexedWithY,
-    /// (zp,x)
-    ZeroPageIndexedIndirectWithX,
-    /// (zp,y)
-    ZeroPageIndexedIndirectWithY,
+    /// Immediate: #aa
+    /// The given value is used as is
+    Immediate(Byte),
+    /// Absolute: aaaa
+    /// The given value is the memory address of the 8 bit value to use
+    Absolute(Byte2),
+    /// Zero Page: aa
+    /// Reference to one of the first 256 memory locations
+    ZeroPage(Byte),
+    /// Relative: aaaa
+    Relative(Byte),
+    /// Indirect Absolute: (aaaa)
+    /// Used by JMP: Uses the given address as a pointer to the low part of a 16-bit address
+    AbsoluteIndirect(Byte2),
+    /// Absolute Indexed with X: aaaa,X
+    /// The given address is used as a base and the value of X register is added as an offset
+    AbsoluteIndexedWithX(Byte2),
+    /// Absolute Indexed with Y: aaaa,Y
+    /// The given address is used as a base and the value of Y register is added as an offset
+    AbsoluteIndexedWithY(Byte2),
+    /// Zero Page Indexed with X: aa,X
+    /// As absolute indexed with X but in the Zero page memory
+    ZeroPageIndexedWithX(Byte),
+    /// Zero Page Indexed with Y: aa,Y
+    /// As absolute indexed with Y but in the Zero page memory
+    ZeroPageIndexedWithY(Byte),
+    /// Indexed Indirect Addressing: (aa,X)
+    /// Given location +X points to the 16-bit address containing a 16-bit pointer to the value
+    IndexedIndirect(Byte),
+    /// Indirect Indexed Addressing: (aa),Y
+    /// Given location points to a 16-bit address containing a 16 bit pointer to the value after Y is added to it
+    IndirectIndexed(Byte),
 }
 
-enum Opcode {
-    /// Or memory with accumulator
-    ORA,
-    /// And memory with accumulator
-    AND,
-    /// Exclusive or memory with accumulator
-    EOR,
+#[derive(Debug, Hash, Ord, PartialOrd, Eq, PartialEq)]
+pub enum AddressingModeType {
+    Accumulator,
+    Implied,
+    Immediate,
+    Absolute,
+    ZeroPage,
+    AbsoluteIndirect,
+    AbsoluteIndexedWithX,
+    AbsoluteIndexedWithY,
+    ZeroPageIndexedWithX,
+    ZeroPageIndexedWithY,
+    IndexedIndirect,
+    IndirectIndexed,
+}
+
+pub struct AddressingModeBuilder {
+    addressing_mode: AddressingModeType
+}
+
+impl AddressingValue {
+    pub fn get_value(
+        &self,
+        registers: Registers,
+        memory: &Memory
+    ) -> Option<Byte> {
+        match self {
+            AddressingValue::Accumulator => Some(registers.a),
+            AddressingValue::Implied => None,
+            AddressingValue::Immediate(value) => Some(*value),
+            AddressingValue::Absolute(value) => {
+                Some(get_value_from_absolute(*value, memory))
+            },
+            AddressingValue::ZeroPage(value) => {
+                Some(get_value_from_zero_page(*value, memory))
+            },
+            AddressingValue::Relative(value) => {
+                Some(*value)
+            },
+            AddressingValue::AbsoluteIndirect(value) => {
+                Some(get_value_from_absolute_indirect(*value, memory))
+            },
+            AddressingValue::AbsoluteIndexedWithX(value) => {
+                Some(get_value_from_absolute_indexed_with_register(*value, registers.x, memory))
+            }
+            AddressingValue::AbsoluteIndexedWithY(value) => {
+                Some(get_value_from_absolute_indexed_with_register(*value, registers.y, memory))
+            },
+            AddressingValue::ZeroPageIndexedWithX(value) => {
+                Some(get_value_from_zero_page_indexed_with_register(*value, registers.x, memory))
+            },
+            AddressingValue::ZeroPageIndexedWithY(value) => {
+                Some(get_value_from_zero_page_indexed_with_register(*value, registers.y, memory))
+            }
+            AddressingValue::IndexedIndirect(value) => {
+                Some(get_value_from_indexed_indirect(*value, registers, memory))
+            }
+            AddressingValue::IndirectIndexed(value) => {
+                Some(get_value_from_indirect_indexed(*value, registers, memory))
+            }
+        }
+    }
+}
+
+fn get_value_from_indirect_indexed(value: Byte, registers: Registers, memory: &Memory) -> Byte {
+    let target_low = get_value_from_absolute(value as Byte2, memory);
+    let target_high = get_value_from_absolute(value as Byte2 + 1, memory);
+    let target: Byte2 = ((target_high as Byte2) << 8) | target_low as Byte2;
+    let target = target + registers.y as Byte2;
+    get_value_from_absolute(target, memory)
+}
+
+fn get_value_from_indexed_indirect(value: Byte, registers: Registers, memory: &Memory) -> Byte {
+    let location = value as Byte2 + registers.x as Byte2;
+    let target_low = get_value_from_absolute(location, memory);
+    let target_high = get_value_from_absolute(location + 1, memory);
+    let target: Byte2 = ((target_high as Byte2) << 8) | target_low as Byte2;
+    get_value_from_absolute(target, memory)
+}
+
+fn get_value_from_zero_page_indexed_with_register(value: Byte, register_contents: Byte, memory: &Memory) -> Byte {
+    *memory.0.get(value as usize + (register_contents as usize)).unwrap()
+}
+
+fn get_value_from_absolute_indexed_with_register(value: Byte2, register_contents: Byte, memory: &Memory) -> Byte {
+    *memory.0.get(value as usize + register_contents as usize).unwrap()
+}
+
+fn get_value_from_absolute_indirect(value: Byte2, memory: &Memory) -> Byte {
+    let target_low = get_value_from_absolute(value, memory);
+    let target_high = get_value_from_absolute(value + 1, memory);
+    let target: Byte2 = ((target_high as Byte2) << 8) | target_low as Byte2;
+    get_value_from_absolute(target, memory)
+}
+
+fn get_value_from_zero_page(value: Byte, memory: &Memory) -> Byte {
+    *memory.0.get(value as usize).unwrap()
+}
+
+fn get_value_from_absolute(
+    value: Byte2,
+    memory: &Memory
+) -> Byte {
+    *memory.0.get(value as usize).unwrap()
+}
+
+pub enum Opcode {
     /// Add memory to accumulator with carry
     ADC,
-    /// Store accumulator in memory
-    STA,
-    /// Load accumulator with memory
-    LDA,
-    /// Compare memory and accumulator
-    CMP,
-    /// Subtract memory from accumulator with borrow
-    SBC,
+    /// And memory with accumulator
+    AND,
     /// Arithmetic shift left one bit
     ASL,
-    /// Rotate left one bit
-    ROL,
-    /// Logical shift right one bit
-    LSR,
-    /// Rotate right one bit
-    ROR,
-    /// Store index X in memory
-    STX,
-    /// Load index X with memory
-    LDX,
+    /// Compare memory and accumulator
+    CMP,
     /// Decrement memory by one
     DEC,
+    /// Exclusive or memory with accumulator
+    EOR,
     /// Increment memory by one
     INC,
+    /// Load accumulator with memory
+    LDA,
+    /// Load index X with memory
+    LDX,
+    /// Logical shift right one bit
+    LSR,
+    /// Or memory with accumulator
+    ORA,
+    /// Rotate left one bit
+    ROL,
+    /// Rotate right one bit
+    ROR,
+    /// Subtract memory from accumulator with borrow
+    SBC,
+    /// Store accumulator in memory
+    STA,
+    /// Store index X in memory
+    STX,
+
     BIT,
+    CPX,
+    CPY,
     JMP,
     JMP_ABS,
-    STY,
     LDY,
-    CPY,
-    CPX,
+    STY,
 
     // Conditional Branches
     /// Branch on result plus
     BPL,
-    /// Branch on result minus
-    BMI,
-    /// Branch on overflow clear
-    BVC,
-    /// Branch on overflow set
-    BVS,
     /// Branch on carry clear
     BCC,
     /// Branch on carry set
     BCS,
-    /// Branch on result not zero
-    BNE,
     /// Branch on result zero
     BEQ,
+    /// Branch on result minus
+    BMI,
+    /// Branch on result not zero
+    BNE,
+    /// Branch on overflow clear
+    BVC,
+    /// Branch on overflow set
+    BVS,
 
+    /// Break
     BRK,
-    JSR_ABS,
-    RTI,
-    RTS,
-    PHP,
-    PLP,
-    PHA,
-    PLA,
-    DEY,
-    TAY,
-    INY,
-    INX,
+    /// Clear carry
     CLC,
-    SEC,
-    CLI,
-    SEI,
-    TYA,
-    CLV,
+    /// Clear decimal
     CLD,
-    SED,
-    TXA,
-    TXS,
-    TAX,
-    TSX,
+    /// Clear interrupt
+    CLI,
+    /// Clear overflow
+    CLV,
+    /// Decrement X
     DEX,
+    /// Decrement Y
+    DEY,
+    /// Increment X
+    INX,
+    /// Increment Y
+    INY,
+    /// Shuould this just be JSR with abs?
+    JSR,
+    ///
     NOP,
+    /// Push accumulator
+    PHA,
+    /// Push processor status
+    PHP,
+    /// Pull accumulator
+    PLA,
+    /// Pull processor status
+    PLP,
+    /// Return from interrupt
+    RTI,
+    /// Return from subroutine
+    RTS,
+    /// Set carry
+    SEC,
+    /// Set decimal
+    SED,
+    /// Set interrupt
+    SEI,
+    /// Transfer A to X
+    TAX,
+    /// Transfer A to Y
+    TAY,
+    /// Transfer stack pointer to X
+    TSX,
+    /// Transfer X to A
+    TXA,
+    /// Transfer X to stack pointer
+    TXS,
+    /// Transfer Y to A
+    TYA,
 }
 
-/// "Group One" instructions
-fn decode_opcode_aaa_xxx_01(opcode: Byte) -> Opcode {
-    match opcode & 0b11100011 {
-        0b000_000_01 => Opcode::ORA,
-        0b001_000_01 => Opcode::AND,
-        0b010_000_01 => Opcode::EOR,
-        0b011_000_01 => Opcode::ADC,
-        0b100_000_01 => Opcode::STA,
-        0b101_000_01 => Opcode::LDA,
-        0b110_000_01 => Opcode::CMP,
-        0b111_000_01 => Opcode::SBC,
-        op => unreachable!("{op}"),
-    }
-}
-
-fn decode_addressing_mode_xxx_bbb_01(opcode: Byte) -> AddressingMode {
-    match opcode & 0b00011111 {
-        0b000_000_01 => AddressingMode::ZeroPageIndexedIndirectWithX,
-        0b000_001_01 => AddressingMode::ZeroPage,
-        0b000_010_01 => AddressingMode::Immediate,
-        0b000_011_01 => AddressingMode::Absolute,
-        0b000_100_01 => AddressingMode::ZeroPageIndexedIndirectWithY,
-        0b000_101_01 => AddressingMode::ZeroPageIndexedWithX,
-        0b000_110_01 => AddressingMode::AbsoluteIndexedWithY,
-        0b000_111_01 => AddressingMode::AbsoluteIndexedWithX,
-        op => unreachable!("{op}"),
-    }
-}
-
-/// "Group Two" instructions
-fn decode_opcode_aaa_xxx_10(opcode: Byte) -> Opcode {
-    match opcode & 0b11100011 {
-        0b000_000_10 => Opcode::ASL,
-        0b001_000_10 => Opcode::ROL,
-        0b010_000_10 => Opcode::LSR,
-        0b011_000_10 => Opcode::ROR,
-        0b100_000_10 => Opcode::STX,
-        0b101_000_10 => Opcode::LDX,
-        0b110_000_10 => Opcode::DEC,
-        0b111_000_10 => Opcode::INC,
-        op => unreachable!("{op}"),
-    }
-}
-
-fn decode_addressing_mode_xxx_bbb_10(opcode: Byte) -> AddressingMode {
-    match opcode & 0b00011111 {
-        0b000_000_10 => AddressingMode::Immediate,
-        0b000_001_10 => AddressingMode::ZeroPage,
-        0b000_010_10 => AddressingMode::Accumulator,
-        0b000_011_10 => AddressingMode::Absolute,
-        // With STX and LDX this is ZeroPageIndexedWithX
-        0b000_101_10 => AddressingMode::ZeroPageIndexedWithX,
-        // With LDX this is AbsoluteIndexedWithY,
-        0b000_111_10 => AddressingMode::AbsoluteIndexedWithX,
-        op => unreachable!("{op}"),
-    }
-}
-
-/// "Group Three"" instructions
-fn decode_opcode_aaa_xxx_00(opcode: Byte) -> Opcode {
-    match opcode & 0b11100011 {
-        0b001_000_00 => Opcode::BIT,
-        0b010_000_00 => Opcode::JMP,
-        0b011_000_00 => Opcode::JMP_ABS,
-        0b100_000_00 => Opcode::STY,
-        0b101_000_00 => Opcode::LDY,
-        0b110_000_00 => Opcode::CPY,
-        0b111_000_00 => Opcode::CPX,
-        op => unreachable!("{op}"),
-    }
-}
-
-fn decode_addressing_mode_xxx_bbb_00(opcode: Byte) -> AddressingMode {
-    match opcode & 0b00011111 {
-        0b000_000_00 => AddressingMode::Immediate,
-        0b000_001_00 => AddressingMode::ZeroPage,
-        0b000_011_00 => AddressingMode::Absolute,
-        // With STX and LDX this is ZeroPageIndexedWithX
-        0b000_101_00 => AddressingMode::ZeroPageIndexedWithX,
-        // With LDX this is AbsoluteIndexedWithY,
-        0b000_111_00 => AddressingMode::AbsoluteIndexedWithX,
-        op => unreachable!("{op}"),
-    }
-}
-
-/// Conditional branch instructions
-fn decode_opcode_xx_y_10000(opcode: Byte) -> Opcode {
-    match opcode & 0b11100011 {
-        0b000_10000 => Opcode::BPL,
-        0b001_10000 => Opcode::BMI,
-        0b010_10000 => Opcode::BVC,
-        0b011_10000 => Opcode::BVS,
-        0b100_10000 => Opcode::BCC,
-        0b101_10000 => Opcode::BCS,
-        0b110_10000 => Opcode::BNE,
-        0b111_10000 => Opcode::BEQ,
-        op => unreachable!("{op}"),
-    }
-}
-
-///  Interrupt and subroutine instructionss
-fn decode_opcode_interrupt_subroutine(opcode: Byte) -> Opcode {
-    match opcode {
-        0b0000_0000 => Opcode::BRK,
-        0b0001_0000 => Opcode::JSR_ABS,
-        0b0010_0000 => Opcode::RTI,
-        0b0100_0000 => Opcode::RTS,
-        op => unreachable!("{op}"),
-    }
-}
-
-fn decode_other_instruction(opcode: Byte) -> Opcode {
-    match opcode {
-        0b0000_0000 => Opcode::PHP,
-        0b0000_0000 => Opcode::PLP,
-        0b0000_0000 => Opcode::PHA,
-        0b0000_0000 => Opcode::PLA,
-        0b0000_0000 => Opcode::DEY,
-        0b0000_0000 => Opcode::TAY,
-        0b0000_0000 => Opcode::INY,
-        0b0000_0000 => Opcode::INX,
-        0b0000_0000 => Opcode::CLC,
-        0b0000_0000 => Opcode::SEC,
-        0b0000_0000 => Opcode::CLI,
-        0b0000_0000 => Opcode::SEI,
-        0b0000_0000 => Opcode::TYA,
-        0b0000_0000 => Opcode::CLV,
-        0b0000_0000 => Opcode::CLD,
-        0b0000_0000 => Opcode::SED,
-        0b0000_0000 => Opcode::TXA,
-        0b0000_0000 => Opcode::TXS,
-        0b0000_0000 => Opcode::TAX,
-        0b0000_0000 => Opcode::TSX,
-        0b0000_0000 => Opcode::DEX,
-        0b0000_0000 => Opcode::NOP,
-        op => unreachable!("{op}"),
-    }
+fn read_opcode(memory: &[Byte]) -> () {
 }
 
 fn main() {
